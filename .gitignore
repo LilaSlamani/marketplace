@@ -1,0 +1,26 @@
+# Env
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# Logs
+logs/
+*.log
+
+# Docker volumes
+pg-airflow-data/
+pg-dwh-data/
+minio-data/
+metabase-data/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
