@@ -1,0 +1,244 @@
+version: "3.8"
+
+# ── Bloc commun Airflow ─────────────────────────────────────────────────────
+x-airflow-common: &airflow-common
+  image: apache/airflow:3.1.8
+  environment: &airflow-common-env
+    # Orchestration
+    AIRFLOW__CORE__EXECUTOR: CeleryExecutor
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW__CORE__FERNET_KEY}
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+
+    # Base de métadonnées Airflow
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_AIRFLOW_USER}:${POSTGRES_AIRFLOW_PASSWORD}@postgres-airflow:5432/${POSTGRES_AIRFLOW_DB}
+
+    # Celery
+    AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql://${POSTGRES_AIRFLOW_USER}:${POSTGRES_AIRFLOW_PASSWORD}@postgres-airflow:5432/${POSTGRES_AIRFLOW_DB}
+    AIRFLOW__CELERY__BROKER_URL: redis://redis:6379/0
+
+    # Credentials admin — SimpleAuthManager (Airflow 3.x, remplace airflow users create)
+    AIRFLOW__SIMPLE_AUTH_MANAGER__USERS: >-
+      [{"username":"admin","role":"Admin","password":"admin"}]
+
+    # ── Connections pré-configurées ──────────────────────────────────────────
+    # Hook marketplace : conn.schema=http, conn.host=api-marketplace, conn.port=5000, conn.password=token
+    AIRFLOW_CONN_MARKETPLACE_API: "http://:${API_TOKEN}@api-marketplace:5000"
+
+    # Hook PostgreSQL DWH
+    AIRFLOW_CONN_POSTGRES_DWH: "postgresql://${POSTGRES_DWH_USER}:${POSTGRES_DWH_PASSWORD}@postgres-dwh:5432/${POSTGRES_DWH_DB}"
+
+    # Hook MinIO (compatible S3Hook via endpoint_url)
+    AIRFLOW_CONN_MINIO_DEFAULT: "aws://${MINIO_ROOT_USER}:${MINIO_ROOT_PASSWORD}@?endpoint_url=http%3A%2F%2Fminio%3A9000"
+
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./plugins:/opt/airflow/plugins
+    - ./logs:/opt/airflow/logs
+    - ./airflow/passwords.json:/opt/airflow/simple_auth_manager_passwords.json.generated
+  networks:
+    - airflow-net
+  depends_on:
+    postgres-airflow:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+
+# ── Services ─────────────────────────────────────────────────────────────────
+services:
+
+  # ── Init (tourne une fois, crée la DB et l'admin) ──────────────────────────
+  airflow-init:
+    <<: *airflow-common
+    command: bash -c "airflow db migrate"
+    restart: "no"
+
+  # ── Airflow ────────────────────────────────────────────────────────────────
+  airflow-apiserver:
+    <<: *airflow-common
+    command: api-server
+    ports:
+      - "8080:8080"
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "airflow", "jobs", "check", "--job-type", "SchedulerJob"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  airflow-dag-processor:
+    <<: *airflow-common
+    command: dag-processor
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-triggerer:
+    <<: *airflow-common
+    command: triggerer
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-worker:
+    <<: *airflow-common
+    command: celery worker
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "celery --app airflow.providers.celery.executors.celery_executor.app inspect ping -d celery@$${HOSTNAME}"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # ── Bases de données ───────────────────────────────────────────────────────
+  postgres-airflow:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: ${POSTGRES_AIRFLOW_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_AIRFLOW_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_AIRFLOW_DB}
+    volumes:
+      - pg-airflow-data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    networks:
+      - airflow-net
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "${POSTGRES_AIRFLOW_USER}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  postgres-dwh:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: ${POSTGRES_DWH_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_DWH_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DWH_DB}
+    volumes:
+      - pg-dwh-data:/var/lib/postgresql/data
+      # schema.sql chargé automatiquement au premier démarrage du conteneur
+      - ./init-db/schema.sql:/docker-entrypoint-initdb.d/schema.sql
+    ports:
+      - "5433:5432"
+    networks:
+      - airflow-net
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "${POSTGRES_DWH_USER}", "-d", "${POSTGRES_DWH_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Redis (broker Celery) ──────────────────────────────────────────────────
+  redis:
+    image: redis:7
+    ports:
+      - "6379:6379"
+    networks:
+      - airflow-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── MinIO (Data Lake — stockage objet raw) ─────────────────────────────────
+  minio:
+    image: minio/minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    volumes:
+      - minio-data:/data
+    ports:
+      - "9000:9000"   # API S3
+      - "9001:9001"   # Console web
+    networks:
+      - airflow-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Crée le bucket data-lake au démarrage
+  minio-init:
+    image: minio/mc
+    depends_on:
+      minio:
+        condition: service_healthy
+    networks:
+      - airflow-net
+    entrypoint: >
+      /bin/sh -c "
+        until mc alias set local http://minio:9000 ${MINIO_ROOT_USER} ${MINIO_ROOT_PASSWORD}; do
+          echo 'MinIO pas encore prêt, retry dans 3s...';
+          sleep 3;
+        done;
+        mc mb --ignore-existing local/${MINIO_BUCKET};
+        echo 'Bucket ${MINIO_BUCKET} prêt.';
+      "
+    restart: "no"
+
+  # ── API Marketplace simulée ────────────────────────────────────────────────
+  api-marketplace:
+    build:
+      context: ./api
+    ports:
+      - "5000:5000"
+    environment:
+      API_TOKEN: ${API_TOKEN}
+      ORDERS_PER_DAY: "800"
+    networks:
+      - airflow-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ── Metabase (dashboards BI) ───────────────────────────────────────────────
+  metabase:
+    image: metabase/metabase:v0.59.6.1
+    ports:
+      - "3000:3000"
+    environment:
+      MB_DB_TYPE: h2
+      MB_DB_FILE: /metabase-data/metabase.db
+    volumes:
+      # Volume nommé obligatoire : sans lui les dashboards sont perdus au docker compose down
+      - metabase-data:/metabase-data
+    networks:
+      - airflow-net
+    depends_on:
+      postgres-dwh:
+        condition: service_healthy
+
+# ── Volumes ───────────────────────────────────────────────────────────────────
+volumes:
+  pg-airflow-data:
+  pg-dwh-data:
+  minio-data:
+  metabase-data:
+
+# ── Réseau ────────────────────────────────────────────────────────────────────
+networks:
+  airflow-net:
+    driver: bridge

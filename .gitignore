@@ -1,6 +1,9 @@
 # Env
 .env
 
+# Airflow passwords
+airflow/passwords.json
+
 # Python
 __pycache__/
 *.pyc
