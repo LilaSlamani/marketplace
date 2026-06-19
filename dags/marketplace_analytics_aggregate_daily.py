@@ -60,28 +60,28 @@ def marketplace_analytics_aggregate_daily():
 
     @task()
     def aggregate_seller_daily(ds=None):
-        """CA par vendeur par jour."""
+        """CA par vendeur par jour. DELETE + INSERT pour refléter les vendeurs inactifs."""
         pg_hook = PostgresHook(postgres_conn_id=PG_CONN_ID)
 
-        sql = """
-            INSERT INTO analytics.seller_daily
-                (dt, seller_id, total_orders, completed_orders, total_revenue)
-            SELECT
-                dt,
-                seller_id,
-                COUNT(*)                                              AS total_orders,
-                COUNT(*) FILTER (WHERE status = 'completed')          AS completed_orders,
-                COALESCE(SUM(total_amount) FILTER (WHERE status = 'completed'), 0) AS total_revenue
-            FROM dwh.fact_orders
-            WHERE dt = %(ds)s
-            GROUP BY dt, seller_id
-            ON CONFLICT (dt, seller_id) DO UPDATE SET
-                total_orders     = EXCLUDED.total_orders,
-                completed_orders = EXCLUDED.completed_orders,
-                total_revenue    = EXCLUDED.total_revenue
-        """
-        pg_hook.run(sql, parameters={"ds": ds})
-        print(f"seller_daily : agrégé pour {ds}")
+        conn = pg_hook.get_conn()
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM analytics.seller_daily WHERE dt = %s", (ds,))
+                cur.execute("""
+                    INSERT INTO analytics.seller_daily
+                        (dt, seller_id, total_orders, completed_orders, total_revenue)
+                    SELECT
+                        dt,
+                        seller_id,
+                        COUNT(*)                                              AS total_orders,
+                        COUNT(*) FILTER (WHERE status = 'completed')          AS completed_orders,
+                        COALESCE(SUM(total_amount) FILTER (WHERE status = 'completed'), 0) AS total_revenue
+                    FROM dwh.fact_orders
+                    WHERE dt = %s
+                    GROUP BY dt, seller_id
+                """, (ds,))
+                count = cur.rowcount
+        print(f"seller_daily : {count} vendeurs pour {ds}")
 
     @task()
     def aggregate_category_daily(ds=None):

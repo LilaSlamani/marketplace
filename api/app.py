@@ -33,8 +33,27 @@ N_SELLERS       = 60
 N_PRODUCTS      = 200
 N_CUSTOMERS     = 500
 COMMISSION_RATE = 0.12
-ANOMALY_DATE    = "2026-04-15"
 REFERENCE_DATE  = date(2026, 4, 1)
+
+# Anomalies volontaires : date → multiplicateur du volume de commandes.
+# Toutes produisent CA < 70 % de la moyenne mobile 7 jours → détectables par le DAG d'anomalies.
+ANOMALIES = {
+    "2026-04-15": 0.50,   # chute -50 % (incident critique)
+    "2026-04-25": 0.45,   # chute -55 % (panne paiement simulée)
+}
+
+# Vendeurs devenus inactifs à partir d'une date donnée.
+# Permet d'alimenter le KPI "vendeurs inactifs > 7 jours" dans Metabase.
+SELLER_INACTIVE_FROM = {
+    "SELL-0051": date(2026, 4, 18),
+    "SELL-0052": date(2026, 4, 19),
+    "SELL-0053": date(2026, 4, 20),
+    "SELL-0054": date(2026, 4, 21),
+    "SELL-0055": date(2026, 4, 20),
+    "SELL-0056": date(2026, 4, 22),
+    "SELL-0057": date(2026, 4, 17),
+    "SELL-0058": date(2026, 4, 16),
+}
 
 CATEGORIES = [
     "Mode", "Électronique", "Maison & Déco",
@@ -242,11 +261,8 @@ def _order_count_for(date_str: str) -> int:
     d = date.fromisoformat(date_str)
     count = ORDERS_PER_DAY
 
-    # Anomalie volontaire : chute de -50 % le 2026-04-15.
-    # Injectée pour avoir quelque chose de concret à détecter lors de la démo
-    # du DAG d'anomalies — sans ça, la courbe 30j serait trop régulière.
-    if date_str == ANOMALY_DATE:
-        return count // 2
+    if date_str in ANOMALIES:
+        return int(count * ANOMALIES[date_str])
 
     # Bonus week-end
     if d.weekday() == 5:    # Samedi +25 %
@@ -269,9 +285,14 @@ def _generate_orders(date_str: str) -> list[dict]:
     # La même date appelée deux fois (test d'idempotence) retourne exactement le même résultat
     # sans recalcul — c'est ce qui prouve le déterminisme côté API.
     rng        = random.Random(seed_from_date(date_str))
-    sellers    = generate_sellers()
+    current    = date.fromisoformat(date_str)
+    sellers    = [s for s in generate_sellers()
+                  if s["seller_id"] not in SELLER_INACTIVE_FROM
+                  or current < SELLER_INACTIVE_FROM[s["seller_id"]]]
+    all_weights = _seller_pareto_weights()
+    all_sellers = generate_sellers()
+    weights    = [all_weights[i] for i, s in enumerate(all_sellers) if s in sellers]
     customers  = generate_customers()
-    weights    = _seller_pareto_weights()
     by_seller  = _products_by_seller()
 
     orders = []

@@ -1,9 +1,12 @@
-version: "3.8"
+
 
 # ── Bloc commun Airflow ─────────────────────────────────────────────────────
 x-airflow-common: &airflow-common
   image: apache/airflow:3.1.8
   environment: &airflow-common-env
+    # Packages Python additionnels installés au démarrage
+    _PIP_ADDITIONAL_REQUIREMENTS: "pytest"
+
     # Orchestration
     AIRFLOW__CORE__EXECUTOR: CeleryExecutor
     AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW__CORE__FERNET_KEY}
@@ -35,6 +38,7 @@ x-airflow-common: &airflow-common
     - ./dags:/opt/airflow/dags
     - ./plugins:/opt/airflow/plugins
     - ./logs:/opt/airflow/logs
+    - ./tests:/opt/airflow/tests
     - ./airflow/passwords.json:/opt/airflow/simple_auth_manager_passwords.json.generated
   networks:
     - airflow-net
